@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -699,19 +700,23 @@ func NewSuccessHandler() *SuccessHandler {
 func (s *SuccessHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(r.URL.Path, "sendMessage") {
 		w.Write([]byte(`{"ok":true,"result":{"message_id": 123123}}`))
-		err := r.ParseForm()
+		err := r.ParseMultipartForm(1024 * 1024)
 		if err != nil {
 			panic(err)
 		}
-		s.RequestMessages = append(s.RequestMessages, r.PostForm.Get("text"))
+		s.RequestMessages = append(s.RequestMessages, r.FormValue("text"))
 		return
 	}
 	isSendDocument := strings.Contains(r.URL.Path, "sendDocument")
 	isSendPhoto := strings.Contains(r.URL.Path, "sendPhoto")
 	if isSendDocument || isSendPhoto {
-		w.Write([]byte(`{}`))
-		if r.FormValue("reply_to_message_id") != "123123" {
-			panic(fmt.Errorf("Unexpected reply_to_message_id: %s", r.FormValue("reply_to_message_id")))
+		w.Write([]byte(`{"ok":true,"result":{"message_id": 234234}}`))
+		replyParamsJSON := r.FormValue("reply_parameters")
+		var replyParams struct {
+			MessageID int `json:"message_id"`
+		}
+		if err := json.Unmarshal([]byte(replyParamsJSON), &replyParams); err != nil || replyParams.MessageID != 123123 {
+			panic(fmt.Errorf("Unexpected reply_parameters: %s", replyParamsJSON))
 		}
 		err := r.ParseMultipartForm(1024 * 1024)
 		if err != nil {

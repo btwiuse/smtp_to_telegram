@@ -2,20 +2,20 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"mime"
-	"mime/multipart"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
+
+	tgbot "github.com/go-telegram/bot"
+	"github.com/go-telegram/bot/models"
 
 	units "github.com/docker/go-units"
 	"github.com/flashmob/go-guerrilla"
@@ -52,16 +52,6 @@ type TelegramConfig struct {
 	forwardedAttachmentMaxPhotoSize  int
 	forwardedAttachmentRespectErrors bool
 	messageLengthToSendAsFile        uint
-}
-
-type TelegramAPIMessageResult struct {
-	Ok     bool                `json:"ok"`
-	Result *TelegramAPIMessage `json:"result"`
-}
-
-type TelegramAPIMessage struct {
-	// https://core.telegram.org/bots/api#message
-	MessageId json.Number `json:"message_id"`
 }
 
 type FormattedEmail struct {
@@ -292,19 +282,26 @@ func SendEmailToTelegram(e *mail.Envelope,
 		return err
 	}
 
-	client := http.Client{
-		Timeout: time.Duration(telegramConfig.telegramApiTimeoutSeconds*1000) * time.Millisecond,
+	timeout := time.Duration(telegramConfig.telegramApiTimeoutSeconds*1000) * time.Millisecond
+	b, err := tgbot.New(
+		telegramConfig.telegramBotToken,
+		tgbot.WithSkipGetMe(),
+		tgbot.WithServerURL(strings.TrimRight(telegramConfig.telegramApiPrefix, "/")),
+		tgbot.WithHTTPClient(timeout, &http.Client{Timeout: timeout}),
+	)
+	if err != nil {
+		return errors.New(SanitizeBotToken(err.Error(), telegramConfig.telegramBotToken))
 	}
 
 	for _, chatId := range strings.Split(telegramConfig.telegramChatIds, ",") {
-		sentMessage, err := SendMessageToChat(message, chatId, telegramConfig, &client)
+		sentMessage, err := SendMessageToChat(message, chatId, b)
 		if err != nil {
 			// If unable to send at least one message -- reject the whole email.
 			return errors.New(SanitizeBotToken(err.Error(), telegramConfig.telegramBotToken))
 		}
 
 		for _, attachment := range message.attachments {
-			err = SendAttachmentToChat(attachment, chatId, telegramConfig, &client, sentMessage)
+			err = SendAttachmentToChat(attachment, chatId, b, sentMessage)
 			if err != nil {
 				err = errors.New(SanitizeBotToken(err.Error(), telegramConfig.telegramBotToken))
 				if telegramConfig.forwardedAttachmentRespectErrors {
@@ -321,112 +318,65 @@ func SendEmailToTelegram(e *mail.Envelope,
 func SendMessageToChat(
 	message *FormattedEmail,
 	chatId string,
-	telegramConfig *TelegramConfig,
-	client *http.Client,
-) (*TelegramAPIMessage, error) {
+	b *tgbot.Bot,
+) (*models.Message, error) {
 	// The native golang's http client supports
 	// http, https and socks5 proxies via HTTP_PROXY/HTTPS_PROXY env vars
 	// out of the box.
 	//
 	// See: https://golang.org/pkg/net/http/#ProxyFromEnvironment
-	resp, err := client.PostForm(
+	return b.SendMessage(context.Background(), &tgbot.SendMessageParams{
 		// https://core.telegram.org/bots/api#sendmessage
-		fmt.Sprintf(
-			"%sbot%s/sendMessage?disable_web_page_preview=true",
-			telegramConfig.telegramApiPrefix,
-			telegramConfig.telegramBotToken,
-		),
-		url.Values{"chat_id": {chatId}, "text": {message.text}},
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return nil, errors.New(fmt.Sprintf(
-			"Non-200 response from Telegram: (%d) %s",
-			resp.StatusCode,
-			EscapeMultiLine(body),
-		))
-	}
-
-	j, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("Error reading json body of sendMessage: %v", err)
-	}
-	result := &TelegramAPIMessageResult{}
-	err = json.Unmarshal(j, result)
-	if err != nil {
-		return nil, fmt.Errorf("Error parsing json body of sendMessage: %v", err)
-	}
-	if result.Ok != true {
-		return nil, fmt.Errorf("ok != true: %s", j)
-	}
-	return result.Result, nil
+		ChatID: chatId,
+		Text:   message.text,
+		LinkPreviewOptions: &models.LinkPreviewOptions{
+			IsDisabled: tgbot.True(),
+		},
+	})
 }
 
 func SendAttachmentToChat(
 	attachment *FormattedAttachment,
 	chatId string,
-	telegramConfig *TelegramConfig,
-	client *http.Client,
-	sentMessage *TelegramAPIMessage,
+	b *tgbot.Bot,
+	sentMessage *models.Message,
 ) error {
-	buf := new(bytes.Buffer)
-	w := multipart.NewWriter(buf)
-	var method string
+	ctx := context.Background()
+	replyParams := &models.ReplyParameters{
+		MessageID: sentMessage.ID,
+	}
 	// https://core.telegram.org/bots/api#sending-files
 	if attachment.fileType == ATTACHMENT_TYPE_DOCUMENT {
 		// https://core.telegram.org/bots/api#senddocument
-		method = "sendDocument"
-		panicIfError(w.WriteField("chat_id", chatId))
-		panicIfError(w.WriteField("reply_to_message_id", fmt.Sprintf("%s", sentMessage.MessageId)))
-		panicIfError(w.WriteField("caption", attachment.caption))
 		// TODO maybe reuse files sent to multiple chats via file_id?
-		dw, err := w.CreateFormFile("document", attachment.filename)
-		panicIfError(err)
-		_, err = dw.Write(attachment.content)
-		panicIfError(err)
+		_, err := b.SendDocument(ctx, &tgbot.SendDocumentParams{
+			ChatID: chatId,
+			Document: &models.InputFileUpload{
+				Filename: attachment.filename,
+				Data:     bytes.NewReader(attachment.content),
+			},
+			Caption:             attachment.caption,
+			DisableNotification: true,
+			ReplyParameters:     replyParams,
+		})
+		return err
 	} else if attachment.fileType == ATTACHMENT_TYPE_PHOTO {
 		// https://core.telegram.org/bots/api#sendphoto
-		method = "sendPhoto"
-		panicIfError(w.WriteField("chat_id", chatId))
-		panicIfError(w.WriteField("reply_to_message_id", fmt.Sprintf("%s", sentMessage.MessageId)))
-		panicIfError(w.WriteField("caption", attachment.caption))
 		// TODO maybe reuse files sent to multiple chats via file_id?
-		dw, err := w.CreateFormFile("photo", attachment.filename)
-		panicIfError(err)
-		_, err = dw.Write(attachment.content)
-		panicIfError(err)
+		_, err := b.SendPhoto(ctx, &tgbot.SendPhotoParams{
+			ChatID: chatId,
+			Photo: &models.InputFileUpload{
+				Filename: attachment.filename,
+				Data:     bytes.NewReader(attachment.content),
+			},
+			Caption:             attachment.caption,
+			DisableNotification: true,
+			ReplyParameters:     replyParams,
+		})
+		return err
 	} else {
 		panic(fmt.Errorf("Unknown file type %d", attachment.fileType))
 	}
-	w.Close()
-
-	resp, err := client.Post(
-		fmt.Sprintf(
-			"%sbot%s/%s?disable_notification=true",
-			telegramConfig.telegramApiPrefix,
-			telegramConfig.telegramBotToken,
-			method,
-		),
-		w.FormDataContentType(),
-		buf,
-	)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return errors.New(fmt.Sprintf(
-			"Non-200 response from Telegram: (%d) %s",
-			resp.StatusCode,
-			EscapeMultiLine(body),
-		))
-	}
-	return nil
 }
 
 func FormatEmail(e *mail.Envelope, telegramConfig *TelegramConfig) (*FormattedEmail, error) {
@@ -631,24 +581,8 @@ func JoinEmailAddresses(a []mail.Address) string {
 	return strings.Join(s, ", ")
 }
 
-func EscapeMultiLine(b []byte) string {
-	// Apparently errors returned by smtp must not contain newlines,
-	// otherwise the data after the first newline is not getting
-	// to the parsed message.
-	s := string(b)
-	s = strings.Replace(s, "\r", "\\r", -1)
-	s = strings.Replace(s, "\n", "\\n", -1)
-	return s
-}
-
 func SanitizeBotToken(s string, botToken string) string {
 	return strings.Replace(s, botToken, "***", -1)
-}
-
-func panicIfError(err error) {
-	if err != nil {
-		panic(err)
-	}
 }
 
 func sigHandler(d guerrilla.Daemon) {
