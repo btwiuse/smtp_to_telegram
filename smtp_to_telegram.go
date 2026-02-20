@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -52,6 +53,14 @@ type TelegramConfig struct {
 	forwardedAttachmentMaxPhotoSize  int
 	forwardedAttachmentRespectErrors bool
 	messageLengthToSendAsFile        uint
+	telegramThreadPerRecipient       bool
+	forumTopicCache                  map[forumTopicCacheKey]int
+	forumTopicCacheMu                sync.Mutex
+}
+
+type forumTopicCacheKey struct {
+	chatId    string
+	recipient string
 }
 
 type FormattedEmail struct {
@@ -117,6 +126,8 @@ func main() {
 			forwardedAttachmentMaxPhotoSize:  int(forwardedAttachmentMaxPhotoSize),
 			forwardedAttachmentRespectErrors: c.Bool("forwarded-attachment-respect-errors"),
 			messageLengthToSendAsFile:        c.Uint("message-length-to-send-as-file"),
+			telegramThreadPerRecipient:       c.Bool("telegram-thread-per-recipient"),
+			forumTopicCache:                  map[forumTopicCacheKey]int{},
 		}
 		d, err := SmtpStart(smtpConfig, telegramConfig)
 		if err != nil {
@@ -212,6 +223,12 @@ func main() {
 			Value:   "info",
 			EnvVars: []string{"ST_LOG_LEVEL"},
 		},
+		&cli.BoolFlag{
+			Name:    "telegram-thread-per-recipient",
+			Usage:   "Create a dedicated Telegram forum topic per recipient email address and send messages to that topic thread",
+			Value:   false,
+			EnvVars: []string{"ST_TELEGRAM_THREAD_PER_RECIPIENT"},
+		},
 	}
 	err := app.Run(os.Args)
 	if err != nil {
@@ -294,20 +311,35 @@ func SendEmailToTelegram(e *mail.Envelope,
 	}
 
 	for _, chatId := range strings.Split(telegramConfig.telegramChatIds, ",") {
-		sentMessage, err := SendMessageToChat(message, chatId, b)
-		if err != nil {
-			// If unable to send at least one message -- reject the whole email.
-			return errors.New(SanitizeBotToken(err.Error(), telegramConfig.telegramBotToken))
+		var threadIds []int
+		if telegramConfig.telegramThreadPerRecipient && len(e.RcptTo) > 0 {
+			for _, recipient := range e.RcptTo {
+				threadId, err := GetOrCreateForumTopic(context.Background(), b, chatId, recipient.String(), telegramConfig)
+				if err != nil {
+					return errors.New(SanitizeBotToken(err.Error(), telegramConfig.telegramBotToken))
+				}
+				threadIds = append(threadIds, threadId)
+			}
+		} else {
+			threadIds = []int{0}
 		}
 
-		for _, attachment := range message.attachments {
-			err = SendAttachmentToChat(attachment, chatId, b, sentMessage)
+		for _, threadId := range threadIds {
+			sentMessage, err := SendMessageToChat(message, chatId, threadId, b)
 			if err != nil {
-				err = errors.New(SanitizeBotToken(err.Error(), telegramConfig.telegramBotToken))
-				if telegramConfig.forwardedAttachmentRespectErrors {
-					return err
-				} else {
-					logger.Errorf("Ignoring attachment sending error: %s", err)
+				// If unable to send at least one message -- reject the whole email.
+				return errors.New(SanitizeBotToken(err.Error(), telegramConfig.telegramBotToken))
+			}
+
+			for _, attachment := range message.attachments {
+				err = SendAttachmentToChat(attachment, chatId, b, sentMessage)
+				if err != nil {
+					err = errors.New(SanitizeBotToken(err.Error(), telegramConfig.telegramBotToken))
+					if telegramConfig.forwardedAttachmentRespectErrors {
+						return err
+					} else {
+						logger.Errorf("Ignoring attachment sending error: %s", err)
+					}
 				}
 			}
 		}
@@ -315,9 +347,34 @@ func SendEmailToTelegram(e *mail.Envelope,
 	return nil
 }
 
+func GetOrCreateForumTopic(
+	ctx context.Context,
+	b *tgbot.Bot,
+	chatId string,
+	recipientEmail string,
+	telegramConfig *TelegramConfig,
+) (int, error) {
+	key := forumTopicCacheKey{chatId: chatId, recipient: recipientEmail}
+	telegramConfig.forumTopicCacheMu.Lock()
+	defer telegramConfig.forumTopicCacheMu.Unlock()
+	if threadId, ok := telegramConfig.forumTopicCache[key]; ok {
+		return threadId, nil
+	}
+	topic, err := b.CreateForumTopic(ctx, &tgbot.CreateForumTopicParams{
+		ChatID: chatId,
+		Name:   recipientEmail,
+	})
+	if err != nil {
+		return 0, err
+	}
+	telegramConfig.forumTopicCache[key] = topic.MessageThreadID
+	return topic.MessageThreadID, nil
+}
+
 func SendMessageToChat(
 	message *FormattedEmail,
 	chatId string,
+	messageThreadID int,
 	b *tgbot.Bot,
 ) (*models.Message, error) {
 	// The native golang's http client supports
@@ -327,8 +384,9 @@ func SendMessageToChat(
 	// See: https://golang.org/pkg/net/http/#ProxyFromEnvironment
 	return b.SendMessage(context.Background(), &tgbot.SendMessageParams{
 		// https://core.telegram.org/bots/api#sendmessage
-		ChatID: chatId,
-		Text:   message.text,
+		ChatID:          chatId,
+		MessageThreadID: messageThreadID,
+		Text:            message.text,
 		LinkPreviewOptions: &models.LinkPreviewOptions{
 			IsDisabled: tgbot.True(),
 		},
