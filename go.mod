@@ -5,6 +5,7 @@ go 1.24.3
 require (
 	github.com/docker/go-units v0.5.0
 	github.com/flashmob/go-guerrilla v1.6.1
+	github.com/go-telegram/bot v1.19.0
 	github.com/jhillyerd/enmime/v2 v2.2.0
 	github.com/stretchr/testify v1.10.0
 	github.com/urfave/cli/v2 v2.27.7
@@ -21,7 +22,6 @@ require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/fatih/color v1.18.0 // indirect
 	github.com/go-sql-driver/mysql v1.4.1 // indirect
-	github.com/go-telegram/bot v1.19.0 // indirect
 	github.com/gogs/chardet v0.0.0-20211120154057-b7413eaefb8f // indirect
 	github.com/inbucket/html2text v1.0.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
