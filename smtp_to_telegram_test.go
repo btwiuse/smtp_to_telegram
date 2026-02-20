@@ -41,6 +41,7 @@ func makeTelegramConfig() *TelegramConfig {
 		forwardedAttachmentMaxPhotoSize:  0,
 		forwardedAttachmentRespectErrors: true,
 		messageLengthToSendAsFile:        4095,
+		forumTopicCache:                  map[forumTopicCacheKey]int{},
 	}
 }
 
@@ -673,6 +674,38 @@ QW5uYS1W6XJvbmlxdWUK
 	assert.Equal(t, exp, h.RequestMessages[0])
 }
 
+func TestThreadPerRecipient(t *testing.T) {
+	smtpConfig := makeSmtpConfig()
+	telegramConfig := makeTelegramConfig()
+	telegramConfig.telegramThreadPerRecipient = true
+	d := startSmtp(smtpConfig, telegramConfig)
+	defer d.Shutdown()
+
+	h := NewSuccessHandler()
+	s := HttpServer(h)
+	defer s.Shutdown(context.Background())
+
+	err := smtp.SendMail(smtpConfig.smtpListen, nil, "from@test", []string{"to@test"}, []byte(`hi`))
+	assert.NoError(t, err)
+
+	chatIds := strings.Split(telegramConfig.telegramChatIds, ",")
+	assert.Len(t, h.RequestForumTopics, len(chatIds))
+	for _, topic := range h.RequestForumTopics {
+		assert.Equal(t, "to@test", topic)
+	}
+	assert.Len(t, h.RequestMessages, len(chatIds))
+	for _, threadID := range h.RequestThreadIDs {
+		assert.Equal(t, 456456, threadID)
+	}
+
+	// Sending a second email to the same recipient must reuse the cached topic (no new createForumTopic calls)
+	err = smtp.SendMail(smtpConfig.smtpListen, nil, "from@test", []string{"to@test"}, []byte(`hi again`))
+	assert.NoError(t, err)
+
+	assert.Len(t, h.RequestForumTopics, len(chatIds), "topic should be reused from cache")
+	assert.Len(t, h.RequestMessages, 2*len(chatIds))
+}
+
 func HttpServer(handler http.Handler) *http.Server {
 	h := &http.Server{Addr: testHttpServerListen, Handler: handler}
 	ln, err := net.Listen("tcp", h.Addr)
@@ -686,18 +719,32 @@ func HttpServer(handler http.Handler) *http.Server {
 }
 
 type SuccessHandler struct {
-	RequestMessages  []string
-	RequestDocuments []*FormattedAttachment
+	RequestMessages      []string
+	RequestDocuments     []*FormattedAttachment
+	RequestForumTopics   []string
+	RequestThreadIDs     []int
 }
 
 func NewSuccessHandler() *SuccessHandler {
 	return &SuccessHandler{
-		RequestMessages:  []string{},
-		RequestDocuments: []*FormattedAttachment{},
+		RequestMessages:    []string{},
+		RequestDocuments:   []*FormattedAttachment{},
+		RequestForumTopics: []string{},
+		RequestThreadIDs:   []int{},
 	}
 }
 
 func (s *SuccessHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.Contains(r.URL.Path, "createForumTopic") {
+		err := r.ParseMultipartForm(1024 * 1024)
+		if err != nil {
+			panic(err)
+		}
+		name := r.FormValue("name")
+		s.RequestForumTopics = append(s.RequestForumTopics, name)
+		w.Write([]byte(`{"ok":true,"result":{"message_thread_id": 456456, "name": "` + name + `"}}`))
+		return
+	}
 	if strings.Contains(r.URL.Path, "sendMessage") {
 		w.Write([]byte(`{"ok":true,"result":{"message_id": 123123}}`))
 		err := r.ParseMultipartForm(1024 * 1024)
@@ -705,6 +752,11 @@ func (s *SuccessHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			panic(err)
 		}
 		s.RequestMessages = append(s.RequestMessages, r.FormValue("text"))
+		threadID := 0
+		if v := r.FormValue("message_thread_id"); v != "" {
+			fmt.Sscanf(v, "%d", &threadID)
+		}
+		s.RequestThreadIDs = append(s.RequestThreadIDs, threadID)
 		return
 	}
 	isSendDocument := strings.Contains(r.URL.Path, "sendDocument")
