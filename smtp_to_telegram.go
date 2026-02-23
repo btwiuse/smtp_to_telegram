@@ -2,20 +2,19 @@ package main
 
 import (
 	"bytes"
-	"context"
+	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"mime"
-	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
-
-	tgbot "github.com/go-telegram/bot"
-	"github.com/go-telegram/bot/models"
 
 	units "github.com/docker/go-units"
 	"github.com/flashmob/go-guerrilla"
@@ -25,6 +24,38 @@ import (
 	"github.com/jhillyerd/enmime/v2"
 	"github.com/urfave/cli/v2"
 )
+
+//go:embed scripts/tg_send_message.sh scripts/tg_send_file.sh
+var scriptsFS embed.FS
+
+var (
+	scriptDir     string
+	scriptDirOnce sync.Once
+	scriptDirErr  error
+)
+
+func ensureScripts() (string, error) {
+	scriptDirOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "smtp_to_telegram_*")
+		if err != nil {
+			scriptDirErr = fmt.Errorf("failed to create script directory: %w", err)
+			return
+		}
+		for _, name := range []string{"tg_send_message.sh", "tg_send_file.sh"} {
+			content, err := scriptsFS.ReadFile("scripts/" + name)
+			if err != nil {
+				scriptDirErr = fmt.Errorf("failed to read embedded script %s: %w", name, err)
+				return
+			}
+			if err := os.WriteFile(filepath.Join(dir, name), content, 0700); err != nil {
+				scriptDirErr = fmt.Errorf("failed to write script %s: %w", name, err)
+				return
+			}
+		}
+		scriptDir = dir
+	})
+	return scriptDir, scriptDirErr
+}
 
 var (
 	Version string = "UNKNOWN_RELEASE"
@@ -282,26 +313,22 @@ func SendEmailToTelegram(e *mail.Envelope,
 		return err
 	}
 
-	timeout := time.Duration(telegramConfig.telegramApiTimeoutSeconds*1000) * time.Millisecond
-	b, err := tgbot.New(
-		telegramConfig.telegramBotToken,
-		tgbot.WithSkipGetMe(),
-		tgbot.WithServerURL(strings.TrimRight(telegramConfig.telegramApiPrefix, "/")),
-		tgbot.WithHTTPClient(timeout, &http.Client{Timeout: timeout}),
-	)
+	sDir, err := ensureScripts()
 	if err != nil {
-		return errors.New(SanitizeBotToken(err.Error(), telegramConfig.telegramBotToken))
+		return err
 	}
 
+	timeoutStr := fmt.Sprintf("%.0f", telegramConfig.telegramApiTimeoutSeconds)
+
 	for _, chatId := range strings.Split(telegramConfig.telegramChatIds, ",") {
-		sentMessage, err := SendMessageToChat(message, chatId, b)
+		msgID, err := SendMessageToChat(message, chatId, sDir, telegramConfig, timeoutStr)
 		if err != nil {
 			// If unable to send at least one message -- reject the whole email.
 			return errors.New(SanitizeBotToken(err.Error(), telegramConfig.telegramBotToken))
 		}
 
 		for _, attachment := range message.attachments {
-			err = SendAttachmentToChat(attachment, chatId, b, sentMessage)
+			err = SendAttachmentToChat(attachment, chatId, sDir, msgID, telegramConfig, timeoutStr)
 			if err != nil {
 				err = errors.New(SanitizeBotToken(err.Error(), telegramConfig.telegramBotToken))
 				if telegramConfig.forwardedAttachmentRespectErrors {
@@ -318,65 +345,87 @@ func SendEmailToTelegram(e *mail.Envelope,
 func SendMessageToChat(
 	message *FormattedEmail,
 	chatId string,
-	b *tgbot.Bot,
-) (*models.Message, error) {
-	// The native golang's http client supports
-	// http, https and socks5 proxies via HTTP_PROXY/HTTPS_PROXY env vars
-	// out of the box.
-	//
-	// See: https://golang.org/pkg/net/http/#ProxyFromEnvironment
-	return b.SendMessage(context.Background(), &tgbot.SendMessageParams{
-		// https://core.telegram.org/bots/api#sendmessage
-		ChatID: chatId,
-		Text:   message.text,
-		LinkPreviewOptions: &models.LinkPreviewOptions{
-			IsDisabled: tgbot.True(),
-		},
-	})
+	scriptDir string,
+	telegramConfig *TelegramConfig,
+	timeoutStr string,
+) (int, error) {
+	// The native curl client supports http, https and socks5 proxies via
+	// HTTP_PROXY/HTTPS_PROXY/ALL_PROXY env vars out of the box.
+	cmd := exec.Command("sh",
+		filepath.Join(scriptDir, "tg_send_message.sh"),
+		telegramConfig.telegramBotToken,
+		telegramConfig.telegramApiPrefix,
+		chatId,
+		timeoutStr,
+	)
+	cmd.Stdin = strings.NewReader(message.text)
+	output, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return 0, fmt.Errorf("tg_send_message failed: %s", string(exitErr.Stderr))
+		}
+		return 0, fmt.Errorf("tg_send_message failed: %w", err)
+	}
+	var resp struct {
+		Result struct {
+			MessageID int `json:"message_id"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &resp); err != nil {
+		return 0, fmt.Errorf("failed to parse sendMessage response: %w", err)
+	}
+	return resp.Result.MessageID, nil
 }
 
 func SendAttachmentToChat(
 	attachment *FormattedAttachment,
 	chatId string,
-	b *tgbot.Bot,
-	sentMessage *models.Message,
+	scriptDir string,
+	replyMsgID int,
+	telegramConfig *TelegramConfig,
+	timeoutStr string,
 ) error {
-	ctx := context.Background()
-	replyParams := &models.ReplyParameters{
-		MessageID: sentMessage.ID,
+	// Write attachment content to a temporary file for curl to upload.
+	tmpFile, err := os.CreateTemp("", "smtp_to_telegram_attach_*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file for attachment: %w", err)
 	}
-	// https://core.telegram.org/bots/api#sending-files
-	if attachment.fileType == ATTACHMENT_TYPE_DOCUMENT {
-		// https://core.telegram.org/bots/api#senddocument
-		// TODO maybe reuse files sent to multiple chats via file_id?
-		_, err := b.SendDocument(ctx, &tgbot.SendDocumentParams{
-			ChatID: chatId,
-			Document: &models.InputFileUpload{
-				Filename: attachment.filename,
-				Data:     bytes.NewReader(attachment.content),
-			},
-			Caption:             attachment.caption,
-			DisableNotification: true,
-			ReplyParameters:     replyParams,
-		})
-		return err
-	} else if attachment.fileType == ATTACHMENT_TYPE_PHOTO {
-		// https://core.telegram.org/bots/api#sendphoto
-		// TODO maybe reuse files sent to multiple chats via file_id?
-		_, err := b.SendPhoto(ctx, &tgbot.SendPhotoParams{
-			ChatID: chatId,
-			Photo: &models.InputFileUpload{
-				Filename: attachment.filename,
-				Data:     bytes.NewReader(attachment.content),
-			},
-			Caption:             attachment.caption,
-			DisableNotification: true,
-			ReplyParameters:     replyParams,
-		})
-		return err
-	} else {
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+	if _, err := tmpFile.Write(attachment.content); err != nil {
+		return fmt.Errorf("failed to write attachment to temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close attachment temp file: %w", err)
+	}
+
+	fileType := "document"
+	if attachment.fileType == ATTACHMENT_TYPE_PHOTO {
+		fileType = "photo"
+	} else if attachment.fileType != ATTACHMENT_TYPE_DOCUMENT {
 		panic(fmt.Errorf("Unknown file type %d", attachment.fileType))
 	}
+
+	// https://core.telegram.org/bots/api#sending-files
+	cmd := exec.Command("sh",
+		filepath.Join(scriptDir, "tg_send_file.sh"),
+		telegramConfig.telegramBotToken,
+		telegramConfig.telegramApiPrefix,
+		chatId,
+		fileType,
+		tmpFile.Name(),
+		attachment.filename,
+		attachment.caption,
+		fmt.Sprintf("%d", replyMsgID),
+		timeoutStr,
+	)
+	if _, err := cmd.Output(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return fmt.Errorf("tg_send_file failed: %s", string(exitErr.Stderr))
+		}
+		return fmt.Errorf("tg_send_file failed: %w", err)
+	}
+	return nil
 }
 
 func FormatEmail(e *mail.Envelope, telegramConfig *TelegramConfig) (*FormattedEmail, error) {
@@ -606,6 +655,9 @@ func sigHandler(d guerrilla.Daemon) {
 			}
 		}()
 		d.Shutdown()
+		if scriptDir != "" {
+			os.RemoveAll(scriptDir)
+		}
 		logger.Info("Shutdown completed, exiting.")
 		return
 	}

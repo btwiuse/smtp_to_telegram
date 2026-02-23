@@ -22,7 +22,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 
 FROM alpine:3.23
 
-RUN apk add --no-cache ca-certificates mailcap
+RUN apk add --no-cache ca-certificates curl mailcap
 
 COPY --from=builder /app/smtp_to_telegram /smtp_to_telegram
 
