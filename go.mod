@@ -5,7 +5,6 @@ go 1.24.3
 require (
 	github.com/docker/go-units v0.5.0
 	github.com/flashmob/go-guerrilla v1.6.1
-	github.com/go-telegram/bot v1.19.0
 	github.com/jhillyerd/enmime/v2 v2.2.0
 	github.com/stretchr/testify v1.10.0
 	github.com/urfave/cli/v2 v2.27.7
