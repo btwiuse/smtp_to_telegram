@@ -402,7 +402,7 @@ func FormatEmail(e *mail.Envelope, telegramConfig *TelegramConfig) (*FormattedEm
 
 	doParts := func(emoji string, parts []*enmime.Part) {
 		for _, part := range parts {
-			if bytes.Compare(part.Content, []byte(env.Text)) == 0 {
+			if bytes.Equal(part.Content, []byte(env.Text)) {
 				continue
 			}
 			if text == "" && part.ContentType == "text/plain" && part.FileName == "" {
@@ -592,7 +592,7 @@ func JoinEmailAddresses(a []mail.Address) string {
 }
 
 func SanitizeBotToken(s string, botToken string) string {
-	return strings.Replace(s, botToken, "***", -1)
+	return strings.ReplaceAll(s, botToken, "***")
 }
 
 func sigHandler(d guerrilla.Daemon) {
