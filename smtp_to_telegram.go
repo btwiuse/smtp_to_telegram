@@ -503,20 +503,29 @@ func FormatEmail(e *mail.Envelope, telegramConfig *TelegramConfig) (*FormattedEm
 	}
 }
 
-func FormatMessage(
-	from string, to string, subject string, text string,
-	formattedAttachmentsDetails string,
-	telegramConfig *TelegramConfig,
-) (string, string) {
-	fullMessageText := strings.TrimSpace(
+func applyMessageTemplate(template, from, to, subject, body, attachmentsDetails string) string {
+	return strings.TrimSpace(
 		strings.NewReplacer(
 			"\\n", "\n",
 			"{from}", from,
 			"{to}", to,
 			"{subject}", subject,
-			"{body}", strings.TrimSpace(text),
-			"{attachments_details}", formattedAttachmentsDetails,
-		).Replace(telegramConfig.messageTemplate),
+			"{body}", body,
+			"{attachments_details}", attachmentsDetails,
+		).Replace(template),
+	)
+}
+
+func FormatMessage(
+	from string, to string, subject string, text string,
+	formattedAttachmentsDetails string,
+	telegramConfig *TelegramConfig,
+) (string, string) {
+	fullMessageText := applyMessageTemplate(
+		telegramConfig.messageTemplate,
+		from, to, subject,
+		strings.TrimSpace(text),
+		formattedAttachmentsDetails,
 	)
 	fullMessageRunes := []rune(fullMessageText)
 	if uint(len(fullMessageRunes)) <= telegramConfig.messageLengthToSendAsFile {
@@ -524,15 +533,11 @@ func FormatMessage(
 		return fullMessageText, ""
 	}
 
-	emptyMessageText := strings.TrimSpace(
-		strings.NewReplacer(
-			"\\n", "\n",
-			"{from}", from,
-			"{to}", to,
-			"{subject}", subject,
-			"{body}", strings.TrimSpace(fmt.Sprintf(".%s", BodyTruncated)),
-			"{attachments_details}", formattedAttachmentsDetails,
-		).Replace(telegramConfig.messageTemplate),
+	emptyMessageText := applyMessageTemplate(
+		telegramConfig.messageTemplate,
+		from, to, subject,
+		strings.TrimSpace(fmt.Sprintf(".%s", BodyTruncated)),
+		formattedAttachmentsDetails,
 	)
 	emptyMessageRunes := []rune(emptyMessageText)
 	if uint(len(emptyMessageRunes)) >= telegramConfig.messageLengthToSendAsFile {
@@ -541,17 +546,13 @@ func FormatMessage(
 	}
 
 	maxBodyLength := telegramConfig.messageLengthToSendAsFile - uint(len(emptyMessageRunes))
-	truncatedMessageText := strings.TrimSpace(
-		strings.NewReplacer(
-			"\\n", "\n",
-			"{from}", from,
-			"{to}", to,
-			"{subject}", subject,
-			// TODO cut by paragraphs + respect formatting
-			"{body}", strings.TrimSpace(fmt.Sprintf("%s%s",
-				string([]rune(strings.TrimSpace(text))[:maxBodyLength]), BodyTruncated)),
-			"{attachments_details}", formattedAttachmentsDetails,
-		).Replace(telegramConfig.messageTemplate),
+	truncatedMessageText := applyMessageTemplate(
+		telegramConfig.messageTemplate,
+		from, to, subject,
+		// TODO cut by paragraphs + respect formatting
+		strings.TrimSpace(fmt.Sprintf("%s%s",
+			string([]rune(strings.TrimSpace(text))[:maxBodyLength]), BodyTruncated)),
+		formattedAttachmentsDetails,
 	)
 	if uint(len([]rune(truncatedMessageText))) > telegramConfig.messageLengthToSendAsFile {
 		panic(fmt.Errorf("Unexpected length of truncated message:\n%d\n%s",
@@ -602,18 +603,14 @@ func sigHandler(d guerrilla.Daemon) {
 		syscall.SIGTERM,
 		syscall.SIGQUIT,
 		syscall.SIGINT,
-		syscall.SIGKILL,
-		os.Kill,
 	)
 	for range signalChannel {
 		logger.Info("Shutdown signal caught")
 		go func() {
-			select {
 			// exit if graceful shutdown not finished in 60 sec.
-			case <-time.After(time.Second * 60):
-				logger.Error("graceful shutdown timed out")
-				os.Exit(1)
-			}
+			<-time.After(time.Second * 60)
+			logger.Error("graceful shutdown timed out")
+			os.Exit(1)
 		}()
 		d.Shutdown()
 		logger.Info("Shutdown completed, exiting.")
