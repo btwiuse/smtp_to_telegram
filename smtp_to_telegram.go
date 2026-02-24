@@ -254,6 +254,27 @@ func SmtpStart(
 
 func TelegramBotProcessorFactory(
 	telegramConfig *TelegramConfig) func() backends.Decorator {
+	// Create the bot and parse chat IDs once per factory invocation so they
+	// are reused across all emails instead of being recreated per message.
+	timeout := time.Duration(telegramConfig.telegramApiTimeoutSeconds*1000) * time.Millisecond
+	b, err := tgbot.New(
+		telegramConfig.telegramBotToken,
+		tgbot.WithSkipGetMe(),
+		tgbot.WithServerURL(strings.TrimRight(telegramConfig.telegramApiPrefix, "/")),
+		tgbot.WithHTTPClient(timeout, &http.Client{Timeout: timeout}),
+	)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create Telegram bot during factory initialization: %s",
+			SanitizeBotToken(err.Error(), telegramConfig.telegramBotToken)))
+	}
+	rawIds := strings.Split(telegramConfig.telegramChatIds, ",")
+	chatIds := make([]string, 0, len(rawIds))
+	for _, id := range rawIds {
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			chatIds = append(chatIds, trimmed)
+		}
+	}
+
 	return func() backends.Decorator {
 		// https://github.com/flashmob/go-guerrilla/wiki/Backends,-configuring-and-extending
 
@@ -261,7 +282,7 @@ func TelegramBotProcessorFactory(
 			return backends.ProcessWith(
 				func(e *mail.Envelope, task backends.SelectTask) (backends.Result, error) {
 					if task == backends.TaskSaveMail {
-						err := SendEmailToTelegram(e, telegramConfig)
+						err := SendEmailToTelegram(e, telegramConfig, b, chatIds)
 						if err != nil {
 							return backends.NewResult(fmt.Sprintf("421 Error: %s", err)), err
 						}
@@ -275,25 +296,14 @@ func TelegramBotProcessorFactory(
 }
 
 func SendEmailToTelegram(e *mail.Envelope,
-	telegramConfig *TelegramConfig) error {
+	telegramConfig *TelegramConfig, b *tgbot.Bot, chatIds []string) error {
 
 	message, err := FormatEmail(e, telegramConfig)
 	if err != nil {
 		return err
 	}
 
-	timeout := time.Duration(telegramConfig.telegramApiTimeoutSeconds*1000) * time.Millisecond
-	b, err := tgbot.New(
-		telegramConfig.telegramBotToken,
-		tgbot.WithSkipGetMe(),
-		tgbot.WithServerURL(strings.TrimRight(telegramConfig.telegramApiPrefix, "/")),
-		tgbot.WithHTTPClient(timeout, &http.Client{Timeout: timeout}),
-	)
-	if err != nil {
-		return errors.New(SanitizeBotToken(err.Error(), telegramConfig.telegramBotToken))
-	}
-
-	for _, chatId := range strings.Split(telegramConfig.telegramChatIds, ",") {
+	for _, chatId := range chatIds {
 		sentMessage, err := SendMessageToChat(message, chatId, b)
 		if err != nil {
 			// If unable to send at least one message -- reject the whole email.
