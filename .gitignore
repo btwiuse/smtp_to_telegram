@@ -1,1 +1,4 @@
 smtp_to_telegram
+ts/node_modules/
+ts/dist/
+ts/package-lock.json
